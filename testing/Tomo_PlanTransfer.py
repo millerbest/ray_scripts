@@ -86,7 +86,6 @@ def transfer_tomo_plan(patient, exam, case, parent_plan, parent_beamset, rs_test
     for s in exported_plans:
         export_names += s + '\n'
 
-
     # Hard coded machine names
     machine_1 = 'HDA0488'
     machine_2 = 'HDA0477'
@@ -231,6 +230,7 @@ def transfer_tomo_plan(patient, exam, case, parent_plan, parent_beamset, rs_test
     if success:
         status.finish(text='DICOM export was successful. You can now close this dialog.')
 
+
 def main():
     # Get current patient, case, exam, plan, and beamset
     try:
@@ -251,14 +251,14 @@ def main():
         plan = None
         beamset = None
 
-
     if 'Tomo' in beamset.DeliveryTechnique:
         transfer_tomo_plan(patient=patient,
-                                    exam=exam,
-                                    case=case,
-                                    parent_plan=plan,
-                                    parent_beamset=beamset,
-                                    rs_test_only=False)
-        return
+                           exam=exam,
+                           case=case,
+                           parent_plan=plan,
+                           parent_beamset=beamset,
+                           rs_test_only=False)
+
 
 if __name__ == '__main__':
+    main()
