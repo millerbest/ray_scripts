@@ -1,12 +1,16 @@
-""" Tomo Plan transfer
+""" Tomo Transfer
 
-    A temporary plan transfer module that will unfortunately not allow for DQA plans to be properly exported
-    due to a plan name conflict. Main purpose is to allow an existing patient plan to be copied as a transfer
-    (daughter - nonPrimary plan in iDMS).
+    -Compute the dose in the daughter plan
+
+    -Send the daughter plan to RayGateway
 
     Version:
-    1.0
+    1.0 Support for multiple beamsets (all assumed to be sent at once).
 
+    TODO: Eliminate the hokey dismissal of the script status as an input. (add delete steps
+       to existing script status method?)
+    TODO: Support single beamset (partial total plan) export
+    TODO: Error catching from raygateway, existing plan error? Try to send anyway
 
     This program is free software: you can redistribute it and/or modify it under
     the terms of the GNU General Public License as published by the Free Software
@@ -23,7 +27,7 @@
 
 __author__ = 'Adam Bayliss and Patrick Hill'
 __contact__ = 'rabayliss@wisc.edu'
-__date__ = '29-Jul-2019'
+__date__ = '07-Nov-2019'
 __version__ = '1.0.0'
 __status__ = 'Production'
 __deprecated__ = False
@@ -39,21 +43,195 @@ __credits__ = []
 
 import sys
 import logging
-import time
 import connect
 import UserInterface
 import DicomExport
 import PlanOperations
-import BeamOperations
 
 
-def main():
+def transfer_tomo_plan(patient, exam, case, parent_plan, parent_beamset, rs_test_only=False):
     # Script will, determine the current machine set for which this beamset is planned
     # Submit the first plan via export method
     # Copy the beamset using the RS CopyAndAdjust method
     # Recompute dose on Copied plan.
-    # TODO: Determine the number of beamsets belonging to this plan, and if they are approved, send all
 
+    steps = ['Approve and save structures/plan']
+    # Set up the workflow steps.
+    steps.append('Create transfer plan')
+    for b in parent_plan.BeamSets:
+        steps.append('Compute transfer plan dose for {}'.format(b.DicomPlanLabel))
+        steps.append('Approve the transfer plan for {}'.format(b.DicomPlanLabel))
+    for b in parent_plan.BeamSets:
+        steps.append('Export transfer version of {} to iDMS'.format(b.DicomPlanLabel))
+
+    status = UserInterface.ScriptStatus(steps=steps,
+                                        docstring=__doc__,
+                                        help=__help__)
+
+    if parent_beamset.Review.ApprovalStatus == 'Approved':
+        logging.debug('Plan status is approved.')
+        status.next_step(text='Plan is approved, proceeding with sending the plan')
+    else:
+        status.aborted()
+        logging.warning('Plans must be approved prior to export')
+        sys.exit('Plans must be approved prior to export')
+
+    # Send all parent beamsets
+    exported_plans = []
+    for b in parent_plan.BeamSets:
+        exported_plans.append(parent_plan.Name + '_' + b.DicomPlanLabel)
+
+    export_names = ''
+
+    for s in exported_plans:
+        export_names += s + '\n'
+
+
+    # Hard coded machine names
+    machine_1 = 'HDA0488'
+    machine_2 = 'HDA0477'
+    if machine_1 in parent_beamset.MachineReference['MachineName']:
+        parent_machine = machine_1
+        daughter_machine = machine_2
+    elif machine_2 in parent_beamset.MachineReference['MachineName']:
+        parent_machine = machine_2
+        daughter_machine = machine_1
+    else:
+        logging.error('Unknown Tomo System, Aborting')
+        sys.exit('Unknown Tomo System: {} Aborting'.format(parent_beamset.MachineReference['MachineName']))
+
+    status.next_step(text='Transfer plan being created.')
+    case.CopyAndAdjustTomoPlanToNewMachine(
+        PlanName=parent_plan.Name,
+        NewMachineName=daughter_machine,
+        OnlyCopyAndChangeMachine=False)
+    logging.info('Transfer plan generated for {}: moving {} to {}'.format(
+        parent_plan.Name, parent_machine, daughter_machine))
+    status.next_step(text='Transfer plan finished, computing dose.')
+    patient.Save()
+
+    # Nutty way of naming plans in RS:
+    # Transfer Plan Name = Original Plan Name + '_Transferred'
+    # For Beamsets:
+    # If the number of characters in the Transfer plan name exceeds 14 char:
+    #   Take Transfer Plan Name, crop to 14 chars  and add _1
+    # Else If less than 14:
+    #   If the number of beamsets is 1 don't add the _1
+    #   If the number of beamsets is > 1 add the index, e.g. '_2'
+    indx = 0
+    daughter_plan_name = parent_plan.Name + '_Transferred'
+    daughter_plan = case.TreatmentPlans[daughter_plan_name]
+    parent_plan_name = parent_plan.Name
+    daughter_plan.Name = parent_plan_name + '_Tr'
+    patient.Save()
+
+    transfer_export_plans = []
+    # Loop through beamsets in the plan
+    for b in parent_plan.BeamSets:
+        indx += 1
+        parent_beamset_name = b.DicomPlanLabel
+
+        if len(daughter_plan_name) >= 14:
+            new_bs_name = daughter_plan_name[:14] + '_' + str(indx)
+        else:
+            if indx == 1:
+                new_bs_name = daughter_plan_name
+            else:
+                new_bs_name = daughter_plan_name + '_' + str(indx)
+
+        daughter_beamset = PlanOperations.find_beamset(plan=daughter_plan,
+                                                       beamset_name=new_bs_name,
+                                                       exact=True)
+        transfer_export_plans.append(new_bs_name)
+        if daughter_beamset is None:
+            logging.error('No daughter beamset {} found in {}, exiting'.format(
+                parent_beamset_name, daughter_plan.Name))
+            sys.exit('Could not find transferred beamset for export')
+        elif daughter_beamset.FractionationPattern.NumberOfFractions != b.FractionationPattern.NumberOfFractions:
+            logging.error('Retrieved wrong beamset for {}, alert script Admin immediately!'.format(b.DicomPlanLabel))
+            sys.exit('Retrieved wrong beamset for {}, alert script Admin immediately!'.format(b.DicomPlanLabel))
+
+        daughter_plan.SetCurrent()
+        connect.get_current('Plan')
+        daughter_beamset.SetCurrent()
+        connect.get_current('BeamSet')
+        daughter_beamset.ComputeDose(
+            ComputeBeamDoses=True,
+            DoseAlgorithm="CCDose",
+            ForceRecompute=False)
+
+        daughter_beamset.DicomPlanLabel = parent_beamset_name[:8] + '_Tr' + daughter_machine[-3:]
+        patient.Save()
+
+        status.next_step(text='Transfer plan dose computed, setting up dose comparison.')
+
+        ui = connect.get_current('ui')
+        ui.TitleBar.MenuItem['Plan Evaluation'].Click()
+        ui.TitleBar.MenuItem['Plan Evaluation'].Popup.MenuItem['Plan Evaluation'].Click()
+        ui.TabControl_ToolBar.TabItem._Approval.Select()
+        ui.ToolPanel.TabItem['Scripting'].Select()
+        connect.await_user_input(
+            'Compare the transfer beamset: {} and parent beamset {}'
+            .format(daughter_beamset.DicomPlanLabel, parent_beamset_name)
+            + ' dose distributions and continue, if acceptable approve this beamset.')
+        status.next_step(text='Transfer plan accepted')
+
+        # Sending report
+
+    # For multiple beamsets, RayStation will not send a beamset to the raygateway for a transferred plan
+    # when a single beamset is approved but the plan is not. Thus, we loop though the beamsets again now that
+    # all transfer beamsets are approved.
+    for b in parent_plan.BeamSets:
+
+        parent_beamset_name = b.DicomPlanLabel
+        parent_plan_iDMS_name = parent_plan.Name + ':' + parent_beamset_name
+        new_bs_name = parent_beamset_name[:8] + '_Tr' + daughter_machine[-3:]
+        daughter_beamset = PlanOperations.find_beamset(plan=daughter_plan,
+                                                       beamset_name=new_bs_name,
+                                                       exact=True)
+        if daughter_beamset is None:
+            logging.error('No daughter beamset {} found in {}, exiting'.format(
+                parent_beamset_name, daughter_plan.Name))
+            sys.exit('Could not find transferred beamset for export')
+        elif daughter_beamset.FractionationPattern.NumberOfFractions != b.FractionationPattern.NumberOfFractions:
+            logging.error('Retrieved wrong beamset for {}, alert script Admin immediately!'.format(b.DicomPlanLabel))
+            sys.exit('Retrieved wrong beamset for {}, alert script Admin immediately!'.format(b.DicomPlanLabel))
+
+        daughter_plan.SetCurrent()
+        connect.get_current('Plan')
+        daughter_beamset.SetCurrent()
+        connect.get_current('BeamSet')
+        status.next_step('Exporting {}'.format(daughter_beamset.DicomPlanLabel))
+        if rs_test_only:
+            success = True
+        else:
+            success = DicomExport.send(case=case,
+                                       destination='RayGateway',
+                                       parent_plan=parent_plan_iDMS_name,
+                                       exam=exam,
+                                       beamset=daughter_beamset,
+                                       ct=True,
+                                       structures=True,
+                                       plan=True,
+                                       plan_dose=True,
+                                       beam_dose=False,
+                                       ignore_warnings=True,
+                                       ignore_errors=False,
+                                       rename=None,
+                                       filters=None,
+                                       machine=None,
+                                       table=None,
+                                       round_jaws=False,
+                                       prescription=False,
+                                       block_accessory=False,
+                                       block_tray_id=False,
+                                       bar=True)
+        status.next_step('Sent transfer plan to iDMS')
+
+    if success:
+        status.finish(text='DICOM export was successful. You can now close this dialog.')
+
+def main():
     # Get current patient, case, exam, plan, and beamset
     try:
         patient = connect.get_current('Patient')
@@ -65,91 +243,22 @@ def main():
         sys.exit('This script requires a patient to be loaded')
 
     try:
-        parent_plan = connect.get_current('Plan')
-        parent_beamset = connect.get_current('BeamSet')
+        plan = connect.get_current('Plan')
+        beamset = connect.get_current('BeamSet')
 
     except Exception:
         logging.debug('A plan and/or beamset is not loaded; plan export options will be disabled')
-        parent_plan = None
-        parent_beamset = None
+        plan = None
+        beamset = None
 
-    if 'Tomo' in parent_beamset.DeliveryTechnique:
-        success = True
 
-        logging.debug('Status of sending parent plan: {}'.format(success))
-        machine_1 = 'HDA0488'
-        machine_2 = 'HDA0477'
-        if machine_1 in parent_beamset.MachineReference['MachineName']:
-            parent_machine = machine_1
-            daughter_machine = machine_2
-        elif machine_2 in parent_beamset.MachineReference['MachineName']:
-            parent_machine = machine_2
-            daughter_machine = machine_1
-        else:
-            logging.error('Unknown Tomo System, Aborting')
-            sys.exit('Unknown Tomo System: {} Aborting'.format(parent_beamset.MachineReference['MachineName']))
-
-        case.CopyAndAdjustTomoPlanToNewMachine(
-            PlanName=parent_plan.Name,
-            NewMachineName=daughter_machine,
-            OnlyCopyAndChangeMachine=False)
-        patient.Save()
-
-        parent_beamset_name = parent_beamset.DicomPlanLabel
-        daughter_plan_name = parent_plan.Name + '_Transferred'
-        daughter_plan = case.TreatmentPlans[daughter_plan_name]
-
-        daughter_beamset = PlanOperations.find_beamset(plan=daughter_plan,
-                                                       beamset_name=parent_plan.Name[:8],
-                                                       exact=False)
-        if daughter_beamset is None:
-            logging.error('No daughter beamset {} found in {}, exiting'.format(
-                parent_beamset_name, daughter_plan.Name))
-            sys.exit('Could not find transferred beamset for export')
-
-        daughter_plan.SetCurrent()
-        connect.get_current('Plan')
-        daughter_beamset.SetCurrent()
-        connect.get_current('BeamSet')
-        daughter_beamset.ComputeDose(
-            ComputeBeamDoses=True,
-            DoseAlgorithm="CCDose",
-            ForceRecompute=False)
-        daughter_plan.Name = parent_plan.Name[:8] + '_Tr'
-        daughter_beamset.DicomPlanLabel = parent_beamset_name[:8] + '_Tr' + daughter_machine[-3:]
-        # Cannot set DSP's once the plan is created or a DICOM failure occurs
-        # BeamOperations.set_dsp(plan=daughter_plan, beam_set=daughter_beamset)
-
-        patient.Save()
-        # Plans must be approved in iDMS prior to sending the transfer plan.
-        connect.await_user_input(
-            'Please go to the iDMS workstation and approve plan {}, '.format(parent_plan.Name) +
-            'Then continue script')
-        parent_plan_iDMS_name = parent_plan.Name + ':' + parent_beamset_name
-        # daughter_beamset.SendTransferredPlanToRayGateway(RayGatewayTitle='RAYGATEWAY',PreviousBeamSet=parent_plan_iDMS_name,OriginalBeamSet=parent_plan_iDMS_name,IgnorePreConditionWarnings=True)
-
-        success = DicomExport.send(case=case,
-                                   destination='RayGateway',
-                                   parent_plan=parent_plan_iDMS_name,
-                                   exam=exam,
-                                   beamset=daughter_beamset,
-                                   ct=True,
-                                   structures=True,
-                                   plan=True,
-                                   plan_dose=True,
-                                   beam_dose=False,
-                                   ignore_warnings=True,
-                                   ignore_errors=False,
-                                   rename=None,
-                                   filters=None,
-                                   machine=None,
-                                   table=None,
-                                   round_jaws=False,
-                                   prescription=False,
-                                   block_accessory=False,
-                                   block_tray_id=False,
-                                   bar=True)
-
+    if 'Tomo' in beamset.DeliveryTechnique:
+        transfer_tomo_plan(patient=patient,
+                                    exam=exam,
+                                    case=case,
+                                    parent_plan=plan,
+                                    parent_beamset=beamset,
+                                    rs_test_only=False)
+        return
 
 if __name__ == '__main__':
-    main()
